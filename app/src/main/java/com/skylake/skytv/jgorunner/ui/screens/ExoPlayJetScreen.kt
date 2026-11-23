@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -37,9 +38,12 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesomeMotion
+import androidx.compose.material.icons.filled.FastForward
+import androidx.compose.material.icons.filled.FastRewind
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularWavyProgressIndicator
@@ -55,6 +59,7 @@ import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -93,6 +98,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
@@ -105,6 +111,7 @@ import androidx.media3.exoplayer.drm.HttpMediaDrmCallback
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FILL
 import androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+import androidx.media3.ui.DefaultTimeBar
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
@@ -127,6 +134,56 @@ import java.util.Calendar
 import kotlin.math.pow
 
 const val TAG = "ExoJetScreen"
+
+/**
+ * Streams whose seekable window is shorter than this are treated as plain live TV
+ * (no scrubbing, Left/Right keep their normal meaning). Pre-recorded shows
+ * (e.g. the Sony LIV ones) expose a much longer window and get scrubbing.
+ */
+private const val MIN_SCRUBBABLE_WINDOW_MS = 3 * 60 * 1000L
+
+/** Seek step for the first presses; grows while the key is tapped/held. */
+private const val SCRUB_BASE_STEP_MS = 10_000L
+
+/** Idle time after the last Left/Right press before the scrub is applied. */
+private const val SCRUB_COMMIT_DELAY_MS = 900L
+
+/** How long the scrub bar stays on screen after a seek was applied. */
+private const val SCRUB_OVERLAY_LINGER_MS = 1500L
+
+/** True when the current stream is a pre-recorded show we can scrub through. */
+private fun Player.supportsScrubbing(): Boolean = try {
+    val d = duration
+    isCurrentMediaItemSeekable &&
+        isCommandAvailable(Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM) &&
+        d != C.TIME_UNSET &&
+        d >= MIN_SCRUBBABLE_WINDOW_MS
+} catch (e: Exception) {
+    false
+}
+
+private fun scrubStepForStreak(streak: Int): Long = when {
+    streak < 4 -> SCRUB_BASE_STEP_MS
+    streak < 10 -> 30_000L
+    streak < 20 -> 60_000L
+    else -> 120_000L
+}
+
+private fun formatScrubTime(ms: Long): String {
+    val total = ms.coerceAtLeast(0L) / 1000
+    val h = total / 3600
+    val m = (total % 3600) / 60
+    val s = total % 60
+    return if (h > 0) String.format(java.util.Locale.US, "%d:%02d:%02d", h, m, s)
+    else String.format(java.util.Locale.US, "%02d:%02d", m, s)
+}
+
+private fun formatScrubDelta(deltaMs: Long): String {
+    val sign = if (deltaMs < 0) "-" else "+"
+    val secs = kotlin.math.abs(deltaMs) / 1000
+    return if (secs < 60) "$sign${secs}s"
+    else String.format(java.util.Locale.US, "%s%d:%02d", sign, secs / 60, secs % 60)
+}
 
 @RequiresApi(Build.VERSION_CODES.O)
 @OptIn(UnstableApi::class)
@@ -170,6 +227,19 @@ fun ExoPlayJetScreen(
     val scope = rememberCoroutineScope()
     var numericJob: Job? by remember { mutableStateOf(null) }
     var isControllerVisible by remember { mutableStateOf(false) }
+
+    // --- Scrubbing (pre-recorded shows only) ---
+    var canScrub by remember { mutableStateOf(false) }
+    var isScrubbing by remember { mutableStateOf(false) }
+    var scrubOverlayVisible by remember { mutableStateOf(false) }
+    var scrubOriginMs by remember { mutableLongStateOf(0L) }
+    var scrubTargetMs by remember { mutableLongStateOf(0L) }
+    var scrubPositionMs by remember { mutableLongStateOf(0L) }
+    var scrubDurationMs by remember { mutableLongStateOf(0L) }
+    var scrubStreak by remember { mutableIntStateOf(0) }
+    var scrubDirection by remember { mutableIntStateOf(0) }
+    var lastScrubKeyTime by remember { mutableLongStateOf(0L) }
+    var scrubJob: Job? by remember { mutableStateOf(null) }
 
     LaunchedEffect(currentChannelIndex) {
         val incoming = currentChannelIndex.coerceAtLeast(0)
@@ -256,6 +326,101 @@ fun ExoPlayJetScreen(
         )
     }
 
+    // Decide whether the current stream is a pre-recorded show we can scrub through.
+    DisposableEffect(exoPlayer) {
+        fun refreshScrubSupport() {
+            canScrub = exoPlayer.supportsScrubbing()
+        }
+        val listener = object : Player.Listener {
+            override fun onTimelineChanged(timeline: Timeline, reason: Int) = refreshScrubSupport()
+            override fun onPlaybackStateChanged(playbackState: Int) = refreshScrubSupport()
+        }
+        exoPlayer.addListener(listener)
+        refreshScrubSupport()
+        onDispose { exoPlayer.removeListener(listener) }
+    }
+
+    fun hideScrubOverlayLater() {
+        scrubJob?.cancel()
+        scrubJob = scope.launch {
+            delay(SCRUB_OVERLAY_LINGER_MS)
+            scrubOverlayVisible = false
+        }
+    }
+
+    fun cancelScrub() {
+        scrubJob?.cancel()
+        isScrubbing = false
+        scrubOverlayVisible = false
+        scrubStreak = 0
+    }
+
+    /** Apply the previewed position to the player. */
+    fun commitScrub() {
+        if (!isScrubbing) return
+        isScrubbing = false
+        scrubStreak = 0
+        try {
+            exoPlayer.seekTo(scrubTargetMs)
+            exoPlayer.playWhenReady = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Scrub seek failed", e)
+        }
+        scrubPositionMs = scrubTargetMs
+    }
+
+    /** Move the scrub position one step in [direction] (-1 = back, +1 = forward). */
+    fun scrubBy(direction: Int) {
+        val duration = exoPlayer.duration
+        if (duration == C.TIME_UNSET || duration <= 0L) return
+
+        val now = SystemClock.uptimeMillis()
+        if (!isScrubbing) {
+            scrubOriginMs = exoPlayer.currentPosition
+            scrubTargetMs = scrubOriginMs
+            scrubStreak = 0
+        } else if (direction == scrubDirection && now - lastScrubKeyTime < 700L) {
+            scrubStreak++
+        } else {
+            scrubStreak = 0
+        }
+        scrubDirection = direction
+        lastScrubKeyTime = now
+
+        scrubTargetMs = (scrubTargetMs + direction * scrubStepForStreak(scrubStreak))
+            .coerceIn(0L, duration)
+        scrubDurationMs = duration
+        scrubPositionMs = exoPlayer.currentPosition
+        isScrubbing = true
+        scrubOverlayVisible = true
+        if (isControllerVisible) exoPlayerView?.hideController()
+
+        // Apply automatically once the user stops pressing; OK applies immediately.
+        scrubJob?.cancel()
+        scrubJob = scope.launch {
+            delay(SCRUB_COMMIT_DELAY_MS)
+            commitScrub()
+            delay(SCRUB_OVERLAY_LINGER_MS)
+            scrubOverlayVisible = false
+        }
+    }
+
+    // Keep the on-screen bar in sync with real playback while it is visible.
+    LaunchedEffect(scrubOverlayVisible) {
+        while (scrubOverlayVisible) {
+            if (!isScrubbing) {
+                scrubPositionMs = exoPlayer.currentPosition
+                val d = exoPlayer.duration
+                if (d != C.TIME_UNSET) scrubDurationMs = d
+            }
+            delay(250)
+        }
+    }
+
+    LaunchedEffect(canScrub) {
+        if (!canScrub) cancelScrub()
+    }
+
     DisposableEffect(exoPlayer) {
         val listener = object : Player.Listener {
             override fun onVideoSizeChanged(videoSize: VideoSize) {
@@ -334,6 +499,7 @@ fun ExoPlayJetScreen(
     LaunchedEffect(currentIndex) {
         retryCountRef.value = 0
         isBuffering = true
+        cancelScrub()
         val currentUrl = channelList?.getOrNull(currentIndex)?.videoUrl ?: videoUrl
         val currrentKeyUrl = channelList?.getOrNull(currentIndex)?.keyUrl ?: keyUrl
 
@@ -451,6 +617,9 @@ fun ExoPlayJetScreen(
 
     BackHandler {
         when {
+            isScrubbing -> {
+                cancelScrub()
+            }
             showChannelPanel -> {
                 showChannelPanel = false
             }
@@ -493,6 +662,42 @@ fun ExoPlayJetScreen(
             .onPreviewKeyEvent { event ->
                 val isOkKey =
                     event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter
+
+                // ---- Pre-recorded shows: Left/Right (and media keys) scrub instead of
+                // opening the channel list. Live channels are not affected. ----
+                if (canScrub && !showChannelPanel && !PlayerCommandBus.isInPipMode) {
+                    // D-pad Left/Right only scrub while the native controller is hidden;
+                    // when it is shown they keep moving focus / driving its slider.
+                    val dpadDir = if (!isControllerVisible) {
+                        when (event.key) {
+                            Key.DirectionLeft -> -1
+                            Key.DirectionRight -> 1
+                            else -> 0
+                        }
+                    } else 0
+                    val mediaDir = when (event.key) {
+                        Key.MediaRewind, Key.MediaSkipBackward -> -1
+                        Key.MediaFastForward, Key.MediaSkipForward -> 1
+                        else -> 0
+                    }
+                    val scrubDir = if (dpadDir != 0) dpadDir else mediaDir
+                    if (scrubDir != 0) {
+                        if (event.type == KeyEventType.KeyDown) scrubBy(scrubDir)
+                        return@onPreviewKeyEvent true
+                    }
+
+                    // OK while scrubbing applies the seek right away (and must not pop
+                    // the native controller up).
+                    if (isScrubbing && isOkKey) {
+                        if (event.type == KeyEventType.KeyUp) {
+                            scrubJob?.cancel()
+                            commitScrub()
+                            hideScrubOverlayLater()
+                        }
+                        return@onPreviewKeyEvent true
+                    }
+                }
+
                 if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionLeft) {
                     if (isControllerVisible) {
                         return@onPreviewKeyEvent false
@@ -612,6 +817,15 @@ fun ExoPlayJetScreen(
                     setControllerVisibilityListener(
                         PlayerView.ControllerVisibilityListener { visibility ->
                             isControllerVisible = visibility == View.VISIBLE
+                            // Recorded show on TV: put focus on the slider so Left/Right
+                            // scrub it right away. Posted because the controller moves
+                            // focus to play/pause right after notifying us.
+                            if (visibility == View.VISIBLE && isTv && exoPlayer.supportsScrubbing()) {
+                                post {
+                                    findViewById<View>(androidx.media3.ui.R.id.exo_progress)
+                                        ?.requestFocus()
+                                }
+                            }
                         }
                     )
 
@@ -630,6 +844,10 @@ fun ExoPlayJetScreen(
                             prevBtn?.visibility = View.GONE
                             nextBtn?.isEnabled = true
                             prevBtn?.isEnabled = true
+
+                            // Slider: fixed 10s per D-pad press instead of 1/20th of the show.
+                            (controller.findViewById<View>(androidx.media3.ui.R.id.exo_progress) as? DefaultTimeBar)
+                                ?.setKeyTimeIncrement(SCRUB_BASE_STEP_MS)
 
                             nextBtn?.setOnClickListener {
                                 try {
@@ -795,6 +1013,20 @@ fun ExoPlayJetScreen(
                     amplitude = 0.75f,
                 )
             }
+        }
+
+        AnimatedVisibility(
+            visible = scrubOverlayVisible && canScrub && !PlayerCommandBus.isInPipMode,
+            modifier = Modifier.align(Alignment.BottomCenter),
+            enter = fadeIn(),
+            exit = fadeOut()
+        ) {
+            ScrubOverlay(
+                positionMs = if (isScrubbing) scrubTargetMs else scrubPositionMs,
+                durationMs = scrubDurationMs,
+                deltaMs = if (isScrubbing) scrubTargetMs - scrubOriginMs else 0L,
+                isScrubbing = isScrubbing
+            )
         }
 
         DisposableEffect(Unit) {
@@ -985,6 +1217,97 @@ fun ExoPlayJetScreen(
 }
 
 @Composable
+private fun ScrubOverlay(
+    positionMs: Long,
+    durationMs: Long,
+    deltaMs: Long,
+    isScrubbing: Boolean
+) {
+    val fraction = if (durationMs > 0L) {
+        (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    } else 0f
+    val accent = Color(0xFF00E5FF)
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 48.dp, vertical = 40.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color.Black.copy(alpha = 0.72f))
+            .padding(horizontal = 20.dp, vertical = 14.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (isScrubbing && deltaMs != 0L) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = if (deltaMs > 0) Icons.Filled.FastForward else Icons.Filled.FastRewind,
+                    contentDescription = null,
+                    tint = accent,
+                    modifier = Modifier.size(22.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = formatScrubDelta(deltaMs),
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = formatScrubTime(positionMs),
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 15.sp,
+                modifier = Modifier.widthIn(min = 56.dp)
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (fraction > 0f) {
+                    Box(
+                        modifier = Modifier
+                            .weight(fraction)
+                            .height(6.dp)
+                            .background(accent, RoundedCornerShape(3.dp))
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .size(if (isScrubbing) 16.dp else 12.dp)
+                        .background(Color.White, CircleShape)
+                )
+                if (fraction < 1f) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f - fraction)
+                            .height(6.dp)
+                            .background(Color.White.copy(alpha = 0.3f), RoundedCornerShape(3.dp))
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Text(
+                text = formatScrubTime(durationMs),
+                color = Color.White.copy(alpha = 0.75f),
+                fontSize = 15.sp,
+                modifier = Modifier.widthIn(min = 56.dp)
+            )
+        }
+    }
+}
+
+@Composable
 fun Dp.toPx(): Float = with(LocalDensity.current) { this@toPx.toPx() }
 
 @Composable
@@ -1166,6 +1489,8 @@ fun initializePlayer(
 
     val player = ExoPlayer.Builder(context, renderersFactory)
         .setLoadControl(loadControl)
+        .setSeekBackIncrementMs(SCRUB_BASE_STEP_MS)
+        .setSeekForwardIncrementMs(SCRUB_BASE_STEP_MS)
         .build()
 
     var useDrmFallback = false
