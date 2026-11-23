@@ -122,9 +122,24 @@ jobs:
       # ---------------------------------------------------------
       # Sign APK
       # ---------------------------------------------------------
+      - name: Check signing credentials
+        id: signing_credentials
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$SIGNING_KEY" ] && [ -n "$ALIAS" ] && [ -n "$KEY_STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Sign APK release
         uses: r0adkll/sign-android-release@v1
         id: sign_app
+        if: steps.signing_credentials.outputs.available == 'true'
         with:
           releaseDirectory: ${{ env.main_project_module }}/build/outputs/apk/release
           signingKeyBase64: ${{ secrets.SIGNING_KEY }}
@@ -143,9 +158,13 @@ jobs:
       # ---------------------------------------------------------
       - name: Rename APK
         run: |
-          mv \
-            ${{ env.main_project_module }}/build/outputs/apk/release/app-release-unsigned-signed.apk \
-            ${{ env.main_project_module }}/build/outputs/apk/release/${{ env.app_name }}-v${{ env.release_version }}-release.apk
+          release_dir="${{ env.main_project_module }}/build/outputs/apk/release"
+          if [ -f "$release_dir/app-release-unsigned-signed.apk" ]; then
+            source_apk="$release_dir/app-release-unsigned-signed.apk"
+          else
+            source_apk="$release_dir/app-release-unsigned.apk"
+          fi
+          mv "$source_apk" "$release_dir/${{ env.app_name }}-v${{ env.release_version }}-release.apk"
 
       # ---------------------------------------------------------
       # Create GitHub Release
