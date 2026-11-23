@@ -4,6 +4,9 @@ env:
   main_project_module: app
   app_name: JTV-GO-Server
 
+permissions:
+  contents: write
+
 on:
   push:
     branches:
