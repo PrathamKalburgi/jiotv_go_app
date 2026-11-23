@@ -35,23 +35,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---------------------------------------------------------
-      # Repository name
-      # ---------------------------------------------------------
       - name: Set repository name
         run: |
           echo "repository_name=$(basename "${{ github.repository }}")" >> "$GITHUB_ENV"
 
-      # ---------------------------------------------------------
-      # Build date
-      # ---------------------------------------------------------
       - name: Set build date
         run: |
           echo "date_today=$(date +%Y%m%d)" >> "$GITHUB_ENV"
 
-      # ---------------------------------------------------------
-      # Extract version from version.gradle
-      # ---------------------------------------------------------
       - name: Extract version information
         run: |
           version_code=$(grep appVersionCode app/version.gradle | awk -F'=' '{print $2}' | tr -d ' "')
@@ -63,9 +54,6 @@ jobs:
           echo "Version Code: $version_code"
           echo "Version Name: $version_name"
 
-      # ---------------------------------------------------------
-      # Determine release type
-      # ---------------------------------------------------------
       - name: Determine release type
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -97,9 +85,6 @@ jobs:
           echo "Release version: $release_version"
           echo "Prerelease: $prerelease"
 
-      # ---------------------------------------------------------
-      # Set up JDK
-      # ---------------------------------------------------------
       - name: Set Up JDK
         uses: actions/setup-java@v4
         with:
@@ -107,75 +92,25 @@ jobs:
           java-version: "18"
           cache: gradle
 
-      # ---------------------------------------------------------
-      # Gradle permissions
-      # ---------------------------------------------------------
       - name: Change permissions for gradlew
         run: chmod +x ./gradlew
 
-      # ---------------------------------------------------------
-      # Build APK
-      # ---------------------------------------------------------
-      - name: Build release APK
-        run: ./gradlew :${{ env.main_project_module }}:assembleRelease
+      # Debug build: signed automatically with the debug key, installable as-is
+      - name: Build debug APK
+        run: ./gradlew :${{ env.main_project_module }}:assembleDebug
 
-      # ---------------------------------------------------------
-      # Sign APK
-      # ---------------------------------------------------------
-      - name: Check signing credentials
-        id: signing_credentials
-        env:
-          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
-          ALIAS: ${{ secrets.ALIAS }}
-          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          if [ -n "$SIGNING_KEY" ] && [ -n "$ALIAS" ] && [ -n "$KEY_STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Sign APK release
-        uses: r0adkll/sign-android-release@v1
-        id: sign_app
-        if: steps.signing_credentials.outputs.available == 'true'
-        with:
-          releaseDirectory: ${{ env.main_project_module }}/build/outputs/apk/release
-          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
-          alias: ${{ secrets.ALIAS }}
-          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
-          # signingKeyBase64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
-          # alias: "release"
-          # keyStorePassword: ${{ secrets.RELEASE_STORE_PASSWORD }}
-          # keyPassword: ${{ secrets.RELEASE_STORE_PASSWORD }}
-        env:
-          BUILD_TOOLS_VERSION: "36.0.0"
-
-      # ---------------------------------------------------------
-      # Rename APK
-      # ---------------------------------------------------------
       - name: Rename APK
         run: |
-          release_dir="${{ env.main_project_module }}/build/outputs/apk/release"
-          if [ -f "$release_dir/app-release-unsigned-signed.apk" ]; then
-            source_apk="$release_dir/app-release-unsigned-signed.apk"
-          else
-            source_apk="$release_dir/app-release-unsigned.apk"
-          fi
-          mv "$source_apk" "$release_dir/${{ env.app_name }}-v${{ env.release_version }}-release.apk"
+          apk_dir="${{ env.main_project_module }}/build/outputs/apk/debug"
+          mv "$apk_dir/app-debug.apk" "$apk_dir/${{ env.app_name }}-v${{ env.release_version }}-release.apk"
 
-      # ---------------------------------------------------------
-      # Create GitHub Release
-      # ---------------------------------------------------------
       - name: Upload APK to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v${{ env.release_version }}"
           name: "v${{ env.release_version }}"
           files: |
-            ${{ env.main_project_module }}/build/outputs/apk/release/${{ env.app_name }}-v${{ env.release_version }}-release.apk
+            ${{ env.main_project_module }}/build/outputs/apk/debug/${{ env.app_name }}-v${{ env.release_version }}-release.apk
           generate_release_notes: true
           draft: false
           prerelease: ${{ env.prerelease }}
